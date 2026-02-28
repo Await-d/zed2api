@@ -1,4 +1,5 @@
 import { icons } from '../icons'
+import { getLocale, t } from '../i18n'
 
 interface CheckResult {
   name: string
@@ -8,10 +9,13 @@ interface CheckResult {
   latency?: number
 }
 
-const CHECKS: { name: string; desc: string; run: () => Promise<Omit<CheckResult, 'name' | 'desc'>> }[] = [
+type CheckDef = { name: string; desc: string; run: () => Promise<Omit<CheckResult, 'name' | 'desc'>> }
+
+function getChecks(): CheckDef[] {
+  return [
   {
-    name: 'API Server',
-    desc: 'Local proxy is responding',
+    name: t('apiServer'),
+    desc: t('apiServerDesc'),
     run: async () => {
       const t0 = performance.now()
       const r = await fetch('/v1/models')
@@ -19,12 +23,12 @@ const CHECKS: { name: string; desc: string; run: () => Promise<Omit<CheckResult,
       if (!r.ok) return { status: 'fail', detail: `HTTP ${r.status}`, latency }
       const d = await r.json()
       const count = d.data?.length ?? 0
-      return { status: 'ok', detail: `${count} models available`, latency }
+      return { status: 'ok', detail: t('modelsAvailable', { count }), latency }
     },
   },
   {
-    name: 'Accounts',
-    desc: 'At least one account configured',
+    name: t('accountsCheck'),
+    desc: t('accountsCheckDesc'),
     run: async () => {
       const t0 = performance.now()
       const r = await fetch('/zed/accounts')
@@ -32,27 +36,27 @@ const CHECKS: { name: string; desc: string; run: () => Promise<Omit<CheckResult,
       if (!r.ok) return { status: 'fail', detail: `HTTP ${r.status}`, latency }
       const d = await r.json()
       const count = d.accounts?.length ?? 0
-      if (count === 0) return { status: 'fail', detail: 'No accounts configured', latency }
+      if (count === 0) return { status: 'fail', detail: t('noAccountsConfigured'), latency }
       const current = d.accounts.find((a: { current: boolean }) => a.current)
-      return { status: 'ok', detail: `${count} account(s), active: ${current?.name ?? 'none'}`, latency }
+      return { status: 'ok', detail: t('accountsActive', { count, name: current?.name ?? t('unknown') }), latency }
     },
   },
   {
-    name: 'Token Refresh',
-    desc: 'Can obtain a JWT from Zed',
+    name: t('tokenRefresh'),
+    desc: t('tokenRefreshDesc'),
     run: async () => {
       const t0 = performance.now()
       const r = await fetch('/zed/usage')
       const latency = Math.round(performance.now() - t0)
-      if (!r.ok) return { status: 'fail', detail: `HTTP ${r.status} — check account credentials`, latency }
+      if (!r.ok) return { status: 'fail', detail: `HTTP ${r.status} — ${t('checkCredentials')}`, latency }
       const d = await r.json()
-      const plan = d.plan ?? 'unknown'
-      return { status: 'ok', detail: `Plan: ${plan}`, latency }
+      const plan = d.plan ?? t('unknown')
+      return { status: 'ok', detail: t('planValue', { plan }), latency }
     },
   },
   {
-    name: 'OpenAI Endpoint',
-    desc: '/v1/chat/completions is reachable',
+    name: t('openaiEndpoint'),
+    desc: t('openaiEndpointDesc'),
     run: async () => {
       const t0 = performance.now()
       try {
@@ -61,13 +65,13 @@ const CHECKS: { name: string; desc: string; run: () => Promise<Omit<CheckResult,
         const latency = Math.round(performance.now() - t0)
         return { status: r.ok ? 'ok' : 'fail', detail: `HTTP ${r.status}`, latency }
       } catch (e) {
-        return { status: 'fail', detail: e instanceof Error ? e.message : 'unreachable' }
+        return { status: 'fail', detail: e instanceof Error ? e.message : t('unreachable') }
       }
     },
   },
   {
-    name: 'Anthropic Endpoint',
-    desc: '/v1/messages is reachable',
+    name: t('anthropicEndpoint'),
+    desc: t('anthropicEndpointDesc'),
     run: async () => {
       const t0 = performance.now()
       try {
@@ -75,22 +79,23 @@ const CHECKS: { name: string; desc: string; run: () => Promise<Omit<CheckResult,
         const latency = Math.round(performance.now() - t0)
         return { status: r.ok ? 'ok' : 'fail', detail: `HTTP ${r.status}`, latency }
       } catch (e) {
-        return { status: 'fail', detail: e instanceof Error ? e.message : 'unreachable' }
+        return { status: 'fail', detail: e instanceof Error ? e.message : t('unreachable') }
       }
     },
   },
-]
+  ]
+}
 
 export function renderHealth() {
   const page = document.getElementById('page-health')!
   page.innerHTML = `
     <div class="page-header" style="display:flex;align-items:flex-end;justify-content:space-between">
       <div>
-        <h2>Health Check</h2>
-        <p>Verify all services are operational.</p>
+        <h2>${t('healthTitle')}</h2>
+        <p>${t('healthDesc')}</p>
       </div>
       <button class="btn" id="rerun-btn">
-        ${icons.refresh} Re-run
+        ${icons.refresh} ${t('rerun')}
       </button>
     </div>
     <div class="page-body">
@@ -106,31 +111,32 @@ export function renderHealth() {
 async function runChecks() {
   const list = document.getElementById('health-list')!
   const summary = document.getElementById('health-summary')!
+  const checks = getChecks()
 
   // Show pending state
-  list.innerHTML = CHECKS.map(c => `
+  list.innerHTML = checks.map(c => `
     <div class="health-row pending">
       <div class="health-status"><span class="spinner"></span></div>
       <div class="health-info">
         <div class="health-name">${c.name}</div>
         <div class="health-desc">${c.desc}</div>
       </div>
-      <div class="health-detail">Checking...</div>
+      <div class="health-detail">${t('checking')}</div>
     </div>
   `).join('')
 
-  summary.innerHTML = `<div class="health-summary-text"><span class="spinner"></span> Running checks...</div>`
+  summary.innerHTML = `<div class="health-summary-text"><span class="spinner"></span> ${t('runningChecks')}</div>`
 
   const results: CheckResult[] = []
 
-  for (let i = 0; i < CHECKS.length; i++) {
-    const c = CHECKS[i]
+  for (let i = 0; i < checks.length; i++) {
+    const c = checks[i]
     let result: CheckResult
     try {
       const r = await c.run()
       result = { name: c.name, desc: c.desc, ...r }
     } catch (e) {
-      result = { name: c.name, desc: c.desc, status: 'fail', detail: e instanceof Error ? e.message : 'error' }
+      result = { name: c.name, desc: c.desc, status: 'fail', detail: e instanceof Error ? e.message : t('genericError') }
     }
     results.push(result)
 
@@ -157,15 +163,16 @@ async function runChecks() {
 
   // Summary
   const passed = results.filter(r => r.status === 'ok').length
-  const total = results.length
+  const total = checks.length
   const allOk = passed === total
+  const locale = getLocale() === 'zh' ? 'zh-CN' : 'en-US'
   summary.innerHTML = `
     <div class="health-summary-icon ${allOk ? 'ok' : 'warn'}">
       ${allOk ? icons.checkCircle : icons.alertCircle}
     </div>
     <div>
-      <div class="health-summary-title">${allOk ? 'All systems operational' : `${passed}/${total} checks passed`}</div>
-      <div class="health-summary-sub">Last checked: ${new Date().toLocaleTimeString()}</div>
+      <div class="health-summary-title">${allOk ? t('allOperational') : t('checksPassed', { passed, total })}</div>
+      <div class="health-summary-sub">${t('lastChecked', { time: new Date().toLocaleTimeString(locale) })}</div>
     </div>
   `
 }

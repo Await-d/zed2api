@@ -1,8 +1,9 @@
 import { icons } from '../icons'
+import { t } from '../i18n'
 import { showToast } from '../toast'
 
 function copyText(text: string) {
-  navigator.clipboard.writeText(text).then(() => showToast('Copied!')).catch(() => {})
+  navigator.clipboard.writeText(text).then(() => showToast(t('copied'))).catch(() => {})
 }
 
 export function renderIntegration() {
@@ -10,8 +11,8 @@ export function renderIntegration() {
   const page = document.getElementById('page-integration')!
   page.innerHTML = `
     <div class="page-header">
-      <h2>Integration</h2>
-      <p>Connect your tools to zed2api.</p>
+      <h2>${t('integrationTitle')}</h2>
+      <p>${t('integrationDesc')}</p>
     </div>
     <div class="page-body">
       <div class="config-list">
@@ -20,8 +21,8 @@ export function renderIntegration() {
             <span class="config-icon">${icons.server}</span> Claude Code
           </div>
           <div class="config-card-body">
-            <p>Add to <code>~/.claude.json</code>:</p>
-            <div class="code-block" id="code-claude"><button class="copy-code-btn" data-target="code-claude">${icons.copy} Copy</button>{
+            <p>${t('addToClaudeConfig')}</p>
+            <div class="code-block" id="code-claude"><button class="copy-code-btn" data-target="code-claude">${icons.copy} ${t('copy')}</button>{
   "apiBaseUrl": "${host}",
   "apiKey": "zed2api"
 }</div>
@@ -33,8 +34,8 @@ export function renderIntegration() {
             <span class="config-icon">${icons.code}</span> OpenAI SDK / cURL
           </div>
           <div class="config-card-body">
-            <p>Use as an OpenAI-compatible endpoint:</p>
-            <div class="code-block" id="code-openai"><button class="copy-code-btn" data-target="code-openai">${icons.copy} Copy</button>export OPENAI_API_BASE=${host}/v1
+            <p>${t('openaiUsage')}</p>
+            <div class="code-block" id="code-openai"><button class="copy-code-btn" data-target="code-openai">${icons.copy} ${t('copy')}</button>export OPENAI_API_BASE=${host}/v1
 export OPENAI_API_KEY=zed2api
 
 curl ${host}/v1/chat/completions \\
@@ -48,8 +49,8 @@ curl ${host}/v1/chat/completions \\
             <span class="config-icon">${icons.globe}</span> Anthropic SDK
           </div>
           <div class="config-card-body">
-            <p>Use as an Anthropic-compatible endpoint:</p>
-            <div class="code-block" id="code-anthropic"><button class="copy-code-btn" data-target="code-anthropic">${icons.copy} Copy</button>export ANTHROPIC_BASE_URL=${host}
+            <p>${t('anthropicUsage')}</p>
+            <div class="code-block" id="code-anthropic"><button class="copy-code-btn" data-target="code-anthropic">${icons.copy} ${t('copy')}</button>export ANTHROPIC_BASE_URL=${host}
 export ANTHROPIC_API_KEY=zed2api
 
 curl ${host}/v1/messages \\

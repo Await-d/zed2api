@@ -59,6 +59,40 @@ zig build -Dtarget=x86_64-linux -Doptimize=ReleaseSafe
 
 打开 http://127.0.0.1:8000 进入 Web 管理界面。
 
+## Docker 部署
+
+```bash
+# 1) 准备账号文件（首次部署）
+cp accounts.example.json accounts.json
+
+# 2) 构建并启动
+docker compose up -d --build
+
+# 3) 查看日志
+docker compose logs -f zed2api
+
+# 4) 停止服务
+docker compose down
+```
+
+默认访问地址：`http://127.0.0.1:8000`
+
+Docker 构建会自动编译 `webui/` 并嵌入真实 Web 管理界面，不再使用占位页面。
+
+自定义宿主机端口：
+
+```bash
+HOST_PORT=9000 docker compose up -d --build
+```
+
+## GitHub OAuth 回调说明
+
+`/zed/login` 会返回 `login_url`，Web UI 会在当前浏览器打开该链接并轮询登录状态。
+
+- Web UI 会把当前浏览器端口传给后端，因此默认只需要一个服务端口（例如 `8000` 或 `9000`）。
+- Docker 场景不需要额外暴露回调端口，`HOST_PORT` 即服务访问端口，也是 OAuth 回调端口。
+- 如需手动覆盖写入 `login_url` 的端口，可设置 `ZED2API_LOGIN_PUBLIC_PORT`。
+
 ## Claude Code 集成
 
 ```bash

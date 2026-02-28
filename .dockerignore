@@ -1,0 +1,13 @@
+.git
+.serena
+.zig-cache
+zig-out
+zig-out-*
+webui/node_modules
+webui/dist
+accounts.json
+github_accounts.json
+debug_*.png
+_debug
+*.exe
+*.pdb

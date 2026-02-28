@@ -1,0 +1,14 @@
+services:
+  zed2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zed2api:local
+    container_name: zed2api-local
+    restart: unless-stopped
+    environment:
+      APP_PORT: 8000
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    volumes:
+      - ./accounts.json:/app/accounts.json:rw

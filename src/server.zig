@@ -10,6 +10,7 @@ const web_ui = @embedFile("web_index_html");
 
 var account_mgr: accounts.AccountManager = undefined;
 var global_allocator: std.mem.Allocator = undefined;
+var server_port: u16 = 0;
 
 // Dynamic models cache
 var cached_models_openai: ?[]const u8 = null;
@@ -18,6 +19,7 @@ const MODELS_CACHE_TTL: i64 = 3600; // 1 hour
 
 pub fn run(allocator: std.mem.Allocator, port: u16) !void {
     global_allocator = allocator;
+    server_port = port;
     account_mgr = accounts.AccountManager.init(allocator);
     defer account_mgr.deinit();
     account_mgr.loadFromFile() catch {};
@@ -68,6 +70,16 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     const method = parts.next() orelse return;
     const full_path = parts.next() orelse return;
     const path = if (std.mem.indexOf(u8, full_path, "?")) |i| full_path[0..i] else full_path;
+
+    const is_login_callback = std.mem.eql(u8, method, "GET") and
+        std.mem.eql(u8, path, "/") and
+        login_status == .waiting and
+        std.mem.indexOf(u8, full_path, "user_id=") != null and
+        std.mem.indexOf(u8, full_path, "access_token=") != null;
+    if (is_login_callback) {
+        handleLoginCallback(conn_stream, full_path);
+        return;
+    }
 
     var content_length: usize = 0;
     var header_lines = std.mem.splitSequence(u8, headers, "\r\n");
@@ -332,14 +344,79 @@ fn convertZedModelsToOpenAI(allocator: std.mem.Allocator, raw: []const u8) ![]co
 }
 
 // ── Login ──
+const LoginSession = struct {
+    keypair: *auth.RsaKeyPair,
+    account_name: []const u8,
+};
+
 var login_status: enum { idle, waiting, success, failed } = .idle;
 var login_error_msg: []const u8 = "";
 var login_result_name: []const u8 = "";
+var login_session: ?LoginSession = null;
+
+fn parseEnvPort(name: []const u8) ?u16 {
+    const raw = std.process.getEnvVarOwned(global_allocator, name) catch return null;
+    defer global_allocator.free(raw);
+    return std.fmt.parseInt(u16, raw, 10) catch null;
+}
+
+fn clearLoginSession() void {
+    const session = login_session orelse return;
+    session.keypair.deinit();
+    global_allocator.destroy(session.keypair);
+    if (session.account_name.len > 0) global_allocator.free(session.account_name);
+    login_session = null;
+}
+
+fn writeLoginSuccessRedirect(conn_stream: std.net.Stream) void {
+    const redirect = "HTTP/1.1 302 Found\r\nLocation: https://zed.dev/native_app_signin_succeeded\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    socket.send(conn_stream, redirect) catch {};
+}
+
+fn handleLoginCallback(conn_stream: std.net.Stream, full_path: []const u8) void {
+    const session = login_session orelse {
+        socket.writeResponse(conn_stream, 409, "{\"error\":\"login session missing\"}");
+        return;
+    };
+
+    const creds = auth.completeLoginFromPath(global_allocator, session.keypair, full_path) catch |err| {
+        login_status = .failed;
+        login_error_msg = @errorName(err);
+        clearLoginSession();
+        socket.writeResponse(conn_stream, 400, "{\"error\":\"bad callback\"}");
+        return;
+    };
+    defer global_allocator.free(creds.user_id);
+    defer global_allocator.free(creds.access_token);
+
+    const name = if (session.account_name.len > 0) session.account_name else creds.user_id;
+    accounts.addAccount(global_allocator, name, creds.user_id, creds.access_token) catch |err| {
+        login_status = .failed;
+        login_error_msg = @errorName(err);
+        clearLoginSession();
+        socket.writeResponse(conn_stream, 500, "{\"error\":\"failed to save account\"}");
+        return;
+    };
+
+    account_mgr.deinit();
+    account_mgr = accounts.AccountManager.init(global_allocator);
+    account_mgr.loadFromFile() catch {};
+
+    if (login_result_name.len > 0) global_allocator.free(login_result_name);
+    login_result_name = global_allocator.dupe(u8, name) catch "";
+    login_error_msg = "";
+    login_status = .success;
+
+    std.debug.print("[login] success: {s}\n", .{name});
+    clearLoginSession();
+    writeLoginSuccessRedirect(conn_stream);
+}
 
 fn handleLogin(body: []const u8) !Response {
     if (login_status == .waiting) return .{ .status = 409, .body = "{\"error\":\"login already in progress\"}" };
 
     var account_name: []const u8 = "";
+    var requested_public_port: ?u16 = null;
     if (body.len > 0) {
         const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch null;
         if (parsed) |p| {
@@ -347,77 +424,50 @@ fn handleLogin(body: []const u8) !Response {
             if (p.value.object.get("name")) |n| {
                 if (n == .string) account_name = global_allocator.dupe(u8, n.string) catch "";
             }
+            if (p.value.object.get("public_port")) |pp| {
+                switch (pp) {
+                    .integer => |v| {
+                        if (v > 0 and v <= std.math.maxInt(u16)) {
+                            requested_public_port = @intCast(v);
+                        }
+                    },
+                    .string => |s| {
+                        requested_public_port = std.fmt.parseInt(u16, s, 10) catch null;
+                    },
+                    else => {},
+                }
+            }
         }
     }
 
     const keypair = try global_allocator.create(auth.RsaKeyPair);
-    keypair.* = auth.RsaKeyPair.generate(global_allocator) catch |err| {
-        global_allocator.destroy(keypair);
-        return err;
-    };
-    const pub_key = keypair.exportPublicKeyB64(global_allocator) catch |err| {
-        keypair.deinit();
-        global_allocator.destroy(keypair);
-        return err;
-    };
+    errdefer global_allocator.destroy(keypair);
+    keypair.* = try auth.RsaKeyPair.generate(global_allocator);
+    errdefer keypair.deinit();
+    if (account_name.len > 0) {
+        errdefer global_allocator.free(account_name);
+    }
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const tcp = try global_allocator.create(std.net.Server);
-    tcp.* = addr.listen(.{}) catch |err| {
-        global_allocator.free(pub_key);
-        keypair.deinit();
-        global_allocator.destroy(keypair);
-        global_allocator.destroy(tcp);
-        return err;
+    const pub_key = try keypair.exportPublicKeyB64(global_allocator);
+    defer global_allocator.free(pub_key);
+
+    const public_port = requested_public_port orelse parseEnvPort("ZED2API_LOGIN_PUBLIC_PORT") orelse server_port;
+    const url = try std.fmt.allocPrint(global_allocator, "https://zed.dev/native_app_signin?native_app_port={d}&native_app_public_key={s}", .{ public_port, pub_key });
+    defer global_allocator.free(url);
+
+    clearLoginSession();
+    login_session = .{
+        .keypair = keypair,
+        .account_name = account_name,
     };
-    const port = tcp.listen_address.getPort();
-    const url = try std.fmt.allocPrint(global_allocator, "https://zed.dev/native_app_signin?native_app_port={d}&native_app_public_key={s}", .{ port, pub_key });
 
     login_status = .waiting;
-    const thread = std.Thread.spawn(.{}, loginWorker, .{ keypair, tcp, pub_key, account_name }) catch {
-        login_status = .failed;
-        tcp.deinit(); global_allocator.destroy(tcp);
-        keypair.deinit(); global_allocator.destroy(keypair);
-        global_allocator.free(pub_key); global_allocator.free(url);
-        return .{ .status = 500, .body = "{\"error\":\"thread spawn failed\"}" };
-    };
-    thread.detach();
-    auth.openBrowserPublic(url);
+    login_error_msg = "";
 
     var resp_buf: [4096]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "{{\"login_url\":\"{s}\",\"port\":{d}}}", .{ url, port });
+    const resp = try std.fmt.bufPrint(&resp_buf, "{{\"login_url\":\"{s}\",\"port\":{d}}}", .{ url, public_port });
     const result = try global_allocator.dupe(u8, resp);
-    global_allocator.free(url);
     return .{ .status = 200, .body = result, .allocated = true };
-}
-
-fn loginWorker(keypair: *auth.RsaKeyPair, tcp: *std.net.Server, pub_key: []const u8, account_name: []const u8) void {
-    defer {
-        tcp.deinit(); global_allocator.destroy(tcp);
-        keypair.deinit(); global_allocator.destroy(keypair);
-        global_allocator.free(pub_key);
-        if (account_name.len > 0) global_allocator.free(account_name);
-    }
-    const creds = auth.loginWithServer(global_allocator, keypair, tcp) catch |err| {
-        login_status = .failed;
-        login_error_msg = @errorName(err);
-        return;
-    };
-    defer global_allocator.free(creds.user_id);
-    defer global_allocator.free(creds.access_token);
-
-    const name = if (account_name.len > 0) account_name else creds.user_id;
-    accounts.addAccount(global_allocator, name, creds.user_id, creds.access_token) catch |err| {
-        login_status = .failed;
-        login_error_msg = @errorName(err);
-        return;
-    };
-    account_mgr.deinit();
-    account_mgr = accounts.AccountManager.init(global_allocator);
-    account_mgr.loadFromFile() catch {};
-    login_result_name = global_allocator.dupe(u8, name) catch "";
-    login_status = .success;
-    std.debug.print("[login] success: {s}\n", .{name});
 }
 
 fn handleLoginStatus() Response {

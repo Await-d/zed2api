@@ -3,15 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_webui = std.process.getEnvVarOwned(b.allocator, "SKIP_WEBUI_BUILD") catch null;
+    defer if (skip_webui) |v| b.allocator.free(v);
 
     // WebUI build step: tsc + vite build in webui/
     // Use node directly to avoid PATH issues with tsc on Windows
-    const node_cmd = if (b.graph.host.result.os.tag == .windows) "node.exe" else "node";
-    const tsc_build = b.addSystemCommand(&.{ node_cmd, "node_modules/typescript/bin/tsc" });
-    tsc_build.setCwd(b.path("webui"));
-    const vite_build = b.addSystemCommand(&.{ node_cmd, "node_modules/vite/bin/vite.js", "build" });
-    vite_build.setCwd(b.path("webui"));
-    vite_build.step.dependOn(&tsc_build.step);
+    var webui_step: ?*std.Build.Step = null;
+    if (skip_webui == null) {
+        const node_cmd = if (b.graph.host.result.os.tag == .windows) "node.exe" else "node";
+        const tsc_build = b.addSystemCommand(&.{ node_cmd, "node_modules/typescript/bin/tsc" });
+        tsc_build.setCwd(b.path("webui"));
+        const vite_build = b.addSystemCommand(&.{ node_cmd, "node_modules/vite/bin/vite.js", "build" });
+        vite_build.setCwd(b.path("webui"));
+        vite_build.step.dependOn(&tsc_build.step);
+        webui_step = &vite_build.step;
+    }
 
     // Zig module
     const mod = b.createModule(.{
@@ -28,7 +34,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // WebUI must be built before compiling (the HTML is embedded)
-    exe.step.dependOn(&vite_build.step);
+    if (webui_step) |s| exe.step.dependOn(s);
 
     if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("bcrypt", .{});

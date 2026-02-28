@@ -505,6 +505,52 @@ pub fn login(allocator: std.mem.Allocator) !Credentials {
 }
 
 /// Wait for OAuth callback on an already-listening TCP server
+pub fn completeLoginFromPath(allocator: std.mem.Allocator, keypair: *RsaKeyPair, full_path: []const u8) !Credentials {
+    const query_start = std.mem.indexOf(u8, full_path, "?") orelse return error.BadCallback;
+    const query = full_path[query_start + 1 ..];
+
+    var user_id: ?[]const u8 = null;
+    var encrypted_token: ?[]const u8 = null;
+    defer if (user_id) |u| allocator.free(u);
+    defer if (encrypted_token) |t| allocator.free(t);
+
+    var query_parts = std.mem.splitScalar(u8, query, '&');
+    while (query_parts.next()) |param| {
+        const eq = std.mem.indexOf(u8, param, "=") orelse continue;
+        const key = param[0..eq];
+        const val = param[eq + 1 ..];
+        if (std.mem.eql(u8, key, "user_id")) {
+            user_id = try urlDecode(allocator, val);
+        } else if (std.mem.eql(u8, key, "access_token")) {
+            encrypted_token = try urlDecode(allocator, val);
+        }
+    }
+
+    const uid = user_id orelse return error.NoUserId;
+    const enc_tok = encrypted_token orelse return error.NoToken;
+
+    var padded_buf: [4096]u8 = undefined;
+    const pad_needed = (4 - (enc_tok.len % 4)) % 4;
+    if (enc_tok.len + pad_needed > padded_buf.len) return error.TokenTooLong;
+    @memcpy(padded_buf[0..enc_tok.len], enc_tok);
+    for (0..pad_needed) |j| padded_buf[enc_tok.len + j] = '=';
+    const padded = padded_buf[0 .. enc_tok.len + pad_needed];
+
+    const decoder = std.base64.url_safe.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(padded) catch return error.BadBase64;
+    const ciphertext = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(ciphertext);
+    decoder.decode(ciphertext, padded) catch return error.BadBase64;
+
+    const plaintext = try keypair.decrypt(allocator, ciphertext);
+    defer allocator.free(plaintext);
+
+    return .{
+        .user_id = try allocator.dupe(u8, uid),
+        .access_token = try allocator.dupe(u8, plaintext),
+    };
+}
+
 pub fn loginWithServer(allocator: std.mem.Allocator, keypair: *RsaKeyPair, tcp: *std.net.Server) !Credentials {
     const conn = tcp.accept() catch return error.AcceptFailed;
     defer conn.stream.close();
@@ -527,61 +573,12 @@ pub fn loginWithServer(allocator: std.mem.Allocator, keypair: *RsaKeyPair, tcp: 
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = parts.next(); // GET
     const full_path = parts.next() orelse return error.BadCallback;
-
-    // Parse query string
-    const query_start = std.mem.indexOf(u8, full_path, "?") orelse return error.BadCallback;
-    const query = full_path[query_start + 1 ..];
-
-    var user_id: ?[]const u8 = null;
-    var encrypted_token: ?[]const u8 = null;
-    defer if (user_id) |u| allocator.free(u);
-
-    var query_parts = std.mem.splitScalar(u8, query, '&');
-    while (query_parts.next()) |param| {
-        const eq = std.mem.indexOf(u8, param, "=") orelse continue;
-        const key = param[0..eq];
-        const val = param[eq + 1 ..];
-        if (std.mem.eql(u8, key, "user_id")) {
-            user_id = try urlDecode(allocator, val);
-        } else if (std.mem.eql(u8, key, "access_token")) {
-            encrypted_token = try urlDecode(allocator, val);
-        }
-    }
-
-    const uid = user_id orelse return error.NoUserId;
-    const enc_tok = encrypted_token orelse return error.NoToken;
-
-    // Decode base64url ciphertext
-    // Add padding if needed
-    var padded_buf: [4096]u8 = undefined;
-    const pad_needed = (4 - (enc_tok.len % 4)) % 4;
-    if (enc_tok.len + pad_needed > padded_buf.len) return error.TokenTooLong;
-    @memcpy(padded_buf[0..enc_tok.len], enc_tok);
-    for (0..pad_needed) |j| padded_buf[enc_tok.len + j] = '=';
-    const padded = padded_buf[0 .. enc_tok.len + pad_needed];
-
-    const decoder = std.base64.url_safe.Decoder;
-    const decoded_len = decoder.calcSizeForSlice(padded) catch return error.BadBase64;
-    const ciphertext = try allocator.alloc(u8, decoded_len);
-    defer allocator.free(ciphertext);
-    decoder.decode(ciphertext, padded) catch return error.BadBase64;
-
-    // Decrypt
-    const plaintext = try keypair.decrypt(allocator, ciphertext);
-    defer allocator.free(plaintext);
+    const creds = try completeLoginFromPath(allocator, keypair, full_path);
 
     // Send redirect response
     const redirect = "HTTP/1.1 302 Found\r\nLocation: https://zed.dev/native_app_signin_succeeded\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     authSocketSend(conn.stream, redirect) catch {};
 
-    // plaintext is the access_token JSON string
-    const result_uid = try allocator.dupe(u8, uid);
-    const result_token = try allocator.dupe(u8, plaintext);
-
-    std.debug.print("[login] success! user_id: {s}\n", .{result_uid});
-
-    return .{
-        .user_id = result_uid,
-        .access_token = result_token,
-    };
+    std.debug.print("[login] success! user_id: {s}\n", .{creds.user_id});
+    return creds;
 }

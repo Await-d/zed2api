@@ -639,6 +639,7 @@ fn handleLogin(body: []const u8) !Response {
 
     var account_name: []const u8 = "";
     var requested_public_port: ?u16 = null;
+    var requested_public_host: ?[]const u8 = null;
     if (body.len > 0) {
         const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch null;
         if (parsed) |p| {
@@ -659,6 +660,11 @@ fn handleLogin(body: []const u8) !Response {
                     else => {},
                 }
             }
+            if (p.value.object.get("public_host")) |ph| {
+                if (ph == .string and ph.string.len > 0) {
+                    requested_public_host = global_allocator.dupe(u8, ph.string) catch null;
+                }
+            }
         }
     }
 
@@ -674,7 +680,13 @@ fn handleLogin(body: []const u8) !Response {
     defer global_allocator.free(pub_key);
 
     const public_port = requested_public_port orelse parseEnvPort("ZED2API_LOGIN_PUBLIC_PORT") orelse server_port;
-    const url = try std.fmt.allocPrint(global_allocator, "https://zed.dev/native_app_signin?native_app_port={d}&native_app_public_key={s}", .{ public_port, pub_key });
+    const is_remote_host = requested_public_host != null and
+        !std.mem.eql(u8, requested_public_host.?, "localhost") and
+        !std.mem.eql(u8, requested_public_host.?, "127.0.0.1");
+    const url = if (is_remote_host)
+        try std.fmt.allocPrint(global_allocator, "https://zed.dev/native_app_signin?native_app_host={s}&native_app_port={d}&native_app_public_key={s}", .{ requested_public_host.?, public_port, pub_key })
+    else
+        try std.fmt.allocPrint(global_allocator, "https://zed.dev/native_app_signin?native_app_port={d}&native_app_public_key={s}", .{ public_port, pub_key });
     defer global_allocator.free(url);
 
     clearLoginSession();

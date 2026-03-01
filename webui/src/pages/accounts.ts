@@ -332,10 +332,11 @@ async function doLogin() {
   banner.innerHTML = `<span class="spinner"></span> ${t('oauthPreparing')}`
   try {
     const currentPort = window.location.port ? Number(window.location.port) : undefined
+    const currentHost = window.location.hostname
     const publicPort = currentPort !== undefined && Number.isFinite(currentPort) && currentPort > 0
       ? Math.trunc(currentPort)
       : undefined
-    const data = await startLogin(undefined, publicPort)
+    const data = await startLogin(undefined, publicPort, currentHost)
     if (data.error) {
       banner.innerHTML = `<span class="error-text">${icons.xCircle} ${esc(data.error)}</span>`
       btn.disabled = false

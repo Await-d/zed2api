@@ -62,11 +62,14 @@ export async function fetchBilling(): Promise<Record<string, unknown>> {
   return r.json()
 }
 
-export async function startLogin(name?: string, publicPort?: number): Promise<{ login_url?: string; error?: string }> {
-  const payload: { name?: string; public_port?: number } = {}
+export async function startLogin(name?: string, publicPort?: number, publicHost?: string): Promise<{ login_url?: string; error?: string }> {
+  const payload: { name?: string; public_port?: number; public_host?: string } = {}
   if (name) payload.name = name
   if (publicPort !== undefined && Number.isFinite(publicPort) && publicPort > 0) {
     payload.public_port = Math.trunc(publicPort)
+  }
+  if (publicHost && publicHost.length > 0) {
+    payload.public_host = publicHost
   }
   const r = await fetch('/zed/login', {
     method: 'POST',

@@ -412,3 +412,187 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+
+/* Account management toolbar */
+.account-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0 12px;
+  flex-wrap: wrap;
+}
+
+.toolbar-count {
+  font-size: 12px; color: var(--text-muted);
+  margin-right: auto;
+}
+
+.btn-sm {
+  padding: 4px 10px; font-size: 12px;
+}
+
+.btn-danger {
+  background: var(--red-bg); color: var(--red);
+  border-color: var(--red);
+}
+.btn-danger:hover {
+  background: var(--red); color: #fff;
+}
+.btn-danger:disabled {
+  opacity: 0.4; cursor: not-allowed;
+}
+.btn-danger:disabled:hover {
+  background: var(--red-bg); color: var(--red);
+}
+
+.btn-secondary {
+  background: var(--bg-input); color: var(--text-secondary);
+  border-color: var(--border);
+}
+.btn-secondary:hover { background: var(--bg-hover); color: var(--text); }
+
+.btn-outline {
+  background: transparent; color: var(--accent);
+  border-color: var(--accent);
+}
+.btn-outline:hover { background: var(--accent-bg); }
+
+.btn-icon {
+  padding: 4px 8px; font-size: 16px;
+  line-height: 1; border-color: transparent;
+  background: transparent; color: var(--text-muted);
+}
+.btn-icon:hover { background: var(--bg-hover); color: var(--text); border-color: var(--border); }
+
+.manage-btn {
+  margin-top: 8px;
+}
+
+/* Checkbox */
+.acc-checkbox-wrap {
+  display: flex; align-items: center; flex-shrink: 0;
+  cursor: pointer;
+}
+.acc-checkbox {
+  width: 16px; height: 16px; cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.card-selected {
+  border-color: var(--accent) !important;
+  background: var(--accent-bg) !important;
+}
+
+/* Per-account dropdown menu */
+.acc-menu-wrap {
+  position: relative;
+}
+
+.acc-dropdown {
+  position: absolute; right: 0; top: calc(100% + 4px);
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-lg);
+  min-width: 160px; z-index: 200;
+  overflow: hidden;
+}
+
+.dropdown-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 8px 14px;
+  font-size: 13px; font-family: var(--font);
+  color: var(--text-secondary);
+  background: transparent; border: none;
+  cursor: pointer; transition: background var(--transition);
+  text-align: left;
+}
+.dropdown-item:hover { background: var(--bg-hover); color: var(--text); }
+.dropdown-item.danger-item { color: var(--red); }
+.dropdown-item.danger-item:hover { background: var(--red-bg); }
+.dropdown-item svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+/* Modal */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.35);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 500;
+}
+
+.modal-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 32px;
+  width: 360px; max-width: 90vw;
+  box-shadow: var(--shadow-lg);
+}
+
+.modal-box h3 {
+  font-size: 16px; font-weight: 700; color: var(--text);
+  margin-bottom: 4px;
+}
+
+.modal-subtitle {
+  font-size: 13px; color: var(--text-muted);
+  margin-bottom: 18px;
+}
+
+.modal-label {
+  display: block;
+  font-size: 12px; font-weight: 600;
+  color: var(--text-secondary); text-transform: uppercase;
+  letter-spacing: 0.04em; margin-bottom: 6px;
+}
+
+.modal-input {
+  width: 100%; padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text); font-size: 14px; font-family: var(--font);
+  outline: none; transition: border-color var(--transition);
+  margin-bottom: 18px;
+}
+
+.modal-input:focus { border-color: var(--accent); background: var(--bg-card); }
+
+.modal-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+
+/* Spend link */
+.spend-link {
+  font-size: 14px; color: var(--accent);
+  text-decoration: none; display: inline-flex;
+  align-items: center; gap: 4px;
+}
+.spend-link:hover { text-decoration: underline; }
+
+/* Plan badge + expiry inline on account cards */
+.account-plan {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.plan-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.account-expires {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.days-left {
+  font-size: 11px;
+  color: var(--yellow);
+  font-weight: 500;
+}

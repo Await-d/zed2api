@@ -2,27 +2,13 @@ export interface Account {
   name: string
   user_id: string
   current: boolean
+  plan?: string
+  expires_at?: string
 }
 
 export interface AccountsResponse {
   accounts: Account[]
   current: string
-}
-
-export interface UsageInfo {
-  plan?: string
-  monthly_spend_in_cents?: number
-  monthly_spending_limit_in_cents?: number
-  subscriptionPeriod?: string[]
-  githubUserLogin?: string
-  // from /client/users/me
-  user?: { github_login?: string; name?: string; avatar_url?: string }
-  planInfo?: {
-    plan?: string
-    subscription_period?: { started_at?: string; ended_at?: string }
-    usage?: { model_requests?: { used?: number; limit?: { limited?: number } } }
-  }
-  [key: string]: unknown
 }
 
 export async function fetchAccounts(): Promise<AccountsResponse> {
@@ -39,10 +25,35 @@ export async function switchAccount(name: string): Promise<void> {
   })
 }
 
-export async function fetchUsage(): Promise<UsageInfo> {
-  const r = await fetch('/zed/usage')
+export async function deleteAccounts(names: string[]): Promise<{ removed: number }> {
+  const r = await fetch('/zed/accounts/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ names }),
+  })
   if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
+}
+
+export async function renameAccount(oldName: string, newName: string): Promise<void> {
+  const r = await fetch('/zed/accounts/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ old_name: oldName, new_name: newName }),
+  })
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}))
+    throw new Error((body as Record<string, string>).error ?? `${r.status}`)
+  }
+}
+
+export async function syncBilling(name: string): Promise<void> {
+  const r = await fetch('/zed/accounts/sync-billing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  if (!r.ok) throw new Error(`${r.status}`)
 }
 
 export async function fetchBilling(): Promise<Record<string, unknown>> {

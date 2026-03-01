@@ -41,7 +41,7 @@ RUN SKIP_WEBUI_BUILD=1 zig build -Doptimize=ReleaseSafe
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
-RUN apt-get update -o Acquire::Retries=8 && apt-get install -y --fix-missing --no-install-recommends ca-certificates socat && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -o Acquire::Retries=8 && apt-get install -y --fix-missing --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=zig-builder /app/zig-out/bin/zed2api /app/zed2api
 COPY accounts.example.json /app/accounts.example.json

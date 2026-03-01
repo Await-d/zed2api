@@ -10,6 +10,7 @@ const web_ui = @embedFile("web_index_html");
 
 var account_mgr: accounts.AccountManager = undefined;
 var global_allocator: std.mem.Allocator = undefined;
+var account_mutex: std.Thread.Mutex = .{};
 var server_port: u16 = 0;
 
 // Dynamic models cache
@@ -33,7 +34,7 @@ pub fn run(allocator: std.mem.Allocator, port: u16) !void {
         std.debug.print("[zed2api] proxy: none (set HTTPS_PROXY to use)\n", .{});
     }
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
     var tcp_server = try addr.listen(.{ .reuse_address = true });
     defer tcp_server.deinit();
 
@@ -160,6 +161,12 @@ fn route(method: []const u8, path: []const u8, body: []const u8) !Response {
         return try handleListAccounts();
     if (std.mem.eql(u8, path, "/zed/accounts/switch") and std.mem.eql(u8, method, "POST"))
         return handleSwitchAccount(body);
+    if (std.mem.eql(u8, path, "/zed/accounts/delete") and std.mem.eql(u8, method, "POST"))
+        return try handleDeleteAccounts(body);
+    if (std.mem.eql(u8, path, "/zed/accounts/rename") and std.mem.eql(u8, method, "POST"))
+        return try handleRenameAccount(body);
+    if (std.mem.eql(u8, path, "/zed/accounts/sync-billing") and std.mem.eql(u8, method, "POST"))
+        return try handleSyncBilling(body);
     if (std.mem.eql(u8, path, "/zed/usage") and std.mem.eql(u8, method, "GET"))
         return try handleUsage();
     if (std.mem.eql(u8, path, "/zed/billing") and std.mem.eql(u8, method, "GET"))
@@ -180,6 +187,7 @@ fn route(method: []const u8, path: []const u8, body: []const u8) !Response {
 // ── Non-streaming proxy with failover ──
 
 fn handleProxy(body: []const u8, is_anthropic: bool) !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     if (account_mgr.list.items.len == 0) return .{ .status = 400, .body = "{\"error\":\"no account configured\"}" };
 
     const total = account_mgr.list.items.len;
@@ -234,15 +242,49 @@ fn handleProxy(body: []const u8, is_anthropic: bool) !Response {
 // ── Account handlers ──
 
 fn handleListAccounts() !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     const w = buf.writer(global_allocator);
     try w.writeAll("{\"accounts\":[");
     for (account_mgr.list.items, 0..) |acc, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"name\":\"{s}\",\"user_id\":\"{s}\",\"current\":{s}}}", .{
-            acc.name, acc.user_id,
-            if (i == account_mgr.current) "true" else "false",
-        });
+
+        // Extract plan: prefer live JWT claims, fall back to persisted acc.plan.
+        var plan_buf: [256]u8 = undefined;
+        var plan_len: usize = 0;
+        plan_blk: {
+            if (acc.jwt_token) |jwt| {
+                const claims = zed.parseJwtClaims(global_allocator, jwt) catch break :plan_blk;
+                defer global_allocator.free(claims);
+                const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, claims, .{}) catch break :plan_blk;
+                defer parsed.deinit();
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("plan")) |pv| {
+                        if (pv == .string) {
+                            const len = @min(pv.string.len, plan_buf.len - 1);
+                            @memcpy(plan_buf[0..len], pv.string[0..len]);
+                            plan_len = len;
+                        }
+                    }
+                }
+            } else if (acc.plan) |p| {
+                // JWT not cached yet — use value persisted by saveBillingInfo.
+                const len = @min(p.len, plan_buf.len - 1);
+                @memcpy(plan_buf[0..len], p[0..len]);
+                plan_len = len;
+            }
+        }
+
+        const expires = acc.expires_at orelse "";
+        try w.print(
+            "{{\"name\":\"{s}\",\"user_id\":\"{s}\",\"current\":{s},\"plan\":\"{s}\",\"expires_at\":\"{s}\"}}",
+            .{
+                acc.name, acc.user_id,
+                if (i == account_mgr.current) "true" else "false",
+                plan_buf[0..plan_len],
+                expires,
+            },
+        );
     }
     try w.print("],\"current\":\"{s}\"}}", .{
         if (account_mgr.getCurrent()) |c| c.name else "",
@@ -251,6 +293,7 @@ fn handleListAccounts() !Response {
 }
 
 fn handleSwitchAccount(body: []const u8) Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
         return .{ .status = 400, .body = "{\"error\":\"invalid json\"}" };
     defer parsed.deinit();
@@ -263,8 +306,184 @@ fn handleSwitchAccount(body: []const u8) Response {
     else
         return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
 }
+fn handleDeleteAccounts(body: []const u8) !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
+    const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
+        return .{ .status = 400, .body = "{\"error\":\"invalid json\"}" };
+    defer parsed.deinit();
 
+    // Accept either {"names":[...]} or {"name":"..."}
+    var names_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer names_list.deinit(global_allocator);
+
+    if (parsed.value.object.get("names")) |v| {
+        if (v == .array) {
+            for (v.array.items) |item| {
+                if (item == .string) {
+                    try names_list.append(global_allocator, item.string);
+                }
+            }
+        }
+    } else if (parsed.value.object.get("name")) |v| {
+        if (v == .string) {
+            try names_list.append(global_allocator, v.string);
+        }
+    }
+
+    if (names_list.items.len == 0)
+        return .{ .status = 400, .body = "{\"error\":\"no names provided\"}" };
+
+    const removed = accounts.removeAccounts(global_allocator, names_list.items) catch
+        return .{ .status = 500, .body = "{\"error\":\"failed to update accounts file\"}" };
+
+    // Reload account manager
+    account_mgr.deinit();
+    account_mgr = accounts.AccountManager.init(global_allocator);
+    account_mgr.loadFromFile() catch {};
+
+    var resp_buf: [128]u8 = undefined;
+    const resp = try std.fmt.bufPrint(&resp_buf, "{{\"removed\":{d}}}", .{removed});
+    return .{ .status = 200, .body = try global_allocator.dupe(u8, resp), .allocated = true };
+}
+
+fn handleRenameAccount(body: []const u8) !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
+    const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
+        return .{ .status = 400, .body = "{\"error\":\"invalid json\"}" };
+    defer parsed.deinit();
+
+    const old_name = switch (parsed.value.object.get("old_name") orelse
+        return .{ .status = 400, .body = "{\"error\":\"missing old_name\"}" }) {
+        .string => |s| s,
+        else => return .{ .status = 400, .body = "{\"error\":\"bad type\"}" },
+    };
+    const new_name = switch (parsed.value.object.get("new_name") orelse
+        return .{ .status = 400, .body = "{\"error\":\"missing new_name\"}" }) {
+        .string => |s| s,
+        else => return .{ .status = 400, .body = "{\"error\":\"bad type\"}" },
+    };
+
+    if (new_name.len == 0)
+        return .{ .status = 400, .body = "{\"error\":\"new_name cannot be empty\"}" };
+
+    accounts.renameAccount(global_allocator, old_name, new_name) catch |err| {
+        if (err == error.NotFound)
+            return .{ .status = 404, .body = "{\"error\":\"account not found\"}" };
+        return .{ .status = 500, .body = "{\"error\":\"failed to update accounts file\"}" };
+    };
+
+    // Reload account manager
+    account_mgr.deinit();
+    account_mgr = accounts.AccountManager.init(global_allocator);
+    account_mgr.loadFromFile() catch {};
+
+    return .{ .status = 200, .body = "{\"success\":true}" };
+}
+
+
+fn handleSyncBilling(body: []const u8) !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
+
+    // Parse optional target account name from body
+    var req_name: ?[]const u8 = null;
+    var body_p: ?std.json.Parsed(std.json.Value) = null;
+    if (body.len > 0) {
+        if (std.json.parseFromSlice(std.json.Value, global_allocator, body, .{})) |p| {
+            body_p = p;
+            if (p.value == .object) {
+                if (p.value.object.get("name")) |v| {
+                    if (v == .string) req_name = v.string;
+                }
+            }
+        } else |_| {}
+    }
+    defer if (body_p) |p| p.deinit();
+
+    // Find the account pointer
+    const acc = blk: {
+        if (req_name) |n| {
+            for (account_mgr.list.items) |*a| {
+                if (std.mem.eql(u8, a.name, n)) break :blk a;
+            }
+            return .{ .status = 404, .body = "{\"error\":\"account not found\"}" };
+        }
+        break :blk account_mgr.getCurrent() orelse
+            return .{ .status = 400, .body = "{\"error\":\"no account\"}" };
+    };
+
+    // Refresh token and extract plan name from JWT claims
+    var plan_buf: [256]u8 = undefined;
+    var plan_len: usize = 0;
+    if (zed.getToken(global_allocator, acc)) |jwt| {
+        if (zed.parseJwtClaims(global_allocator, jwt)) |claims_raw| {
+            defer global_allocator.free(claims_raw);
+            if (std.json.parseFromSlice(std.json.Value, global_allocator, claims_raw, .{})) |c| {
+                defer c.deinit();
+                if (c.value == .object) {
+                    if (c.value.object.get("plan")) |pv| {
+                        if (pv == .string) {
+                            const l = @min(pv.string.len, plan_buf.len - 1);
+                            @memcpy(plan_buf[0..l], pv.string[0..l]);
+                            plan_len = l;
+                        }
+                    }
+                }
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    // Copy fields we need before account_mgr reload
+    const name_dup = try global_allocator.dupe(u8, acc.name);
+    defer global_allocator.free(name_dup);
+    const uid_dup = try global_allocator.dupe(u8, acc.user_id);
+    defer global_allocator.free(uid_dup);
+    const cred_dup = try global_allocator.dupe(u8, acc.credential_json);
+    defer global_allocator.free(cred_dup);
+    const plan_dup = try global_allocator.dupe(u8, plan_buf[0..plan_len]);
+    defer global_allocator.free(plan_dup);
+
+    // Fetch billing (users/me) for expires_at
+    var expires_buf: [64]u8 = undefined;
+    var expires_len: usize = 0;
+    if (zed.fetchBillingUsageRaw(global_allocator, uid_dup, cred_dup)) |billing_raw| {
+        defer global_allocator.free(billing_raw);
+        if (std.json.parseFromSlice(std.json.Value, global_allocator, billing_raw, .{})) |b| {
+            defer b.deinit();
+            if (b.value == .object) {
+                if (b.value.object.get("plan")) |plan_val| {
+                    if (plan_val == .object) {
+                        if (plan_val.object.get("subscription_period")) |sp| {
+                            if (sp == .object) {
+                                if (sp.object.get("ended_at")) |ea| {
+                                    if (ea == .string) {
+                                        const l = @min(ea.string.len, expires_buf.len - 1);
+                                        @memcpy(expires_buf[0..l], ea.string[0..l]);
+                                        expires_len = l;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Persist plan + expires_at
+    accounts.saveBillingInfo(global_allocator, name_dup, plan_dup, expires_buf[0..expires_len]) catch |err| {
+        std.debug.print("[billing] saveBillingInfo failed: {}\n", .{err});
+        return .{ .status = 500, .body = "{\"error\":\"save failed\"}" };
+    };
+
+    // Reload account manager so in-memory data matches disk
+    account_mgr.deinit();
+    account_mgr = accounts.AccountManager.init(global_allocator);
+    account_mgr.loadFromFile() catch {};
+
+    return .{ .status = 200, .body = "{\"success\":true}" };
+}
 fn handleUsage() !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     const acc = account_mgr.getCurrent() orelse return .{ .status = 400, .body = "{\"error\":\"no account\"}" };
     const jwt = try zed.getToken(global_allocator, acc);
     const claims = try zed.parseJwtClaims(global_allocator, jwt);
@@ -272,6 +491,7 @@ fn handleUsage() !Response {
 }
 
 fn handleBilling() !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     const acc = account_mgr.getCurrent() orelse return .{ .status = 400, .body = "{\"error\":\"no account\"}" };
     const user_info = zed.fetchBillingUsage(global_allocator, acc) catch {
         return .{ .status = 502, .body = "{\"error\":\"failed to fetch user info\"}" };
@@ -280,6 +500,7 @@ fn handleBilling() !Response {
 }
 
 fn handleModels() !Response {
+    account_mutex.lock(); defer account_mutex.unlock();
     const now = std.time.timestamp();
     if (cached_models_openai) |cached| {
         if (now - cached_models_time < MODELS_CACHE_TTL) {
@@ -398,6 +619,7 @@ fn handleLoginCallback(conn_stream: std.net.Stream, full_path: []const u8) void 
         return;
     };
 
+    account_mutex.lock(); defer account_mutex.unlock();
     account_mgr.deinit();
     account_mgr = accounts.AccountManager.init(global_allocator);
     account_mgr.loadFromFile() catch {};

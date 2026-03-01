@@ -539,6 +539,6 @@ fn emitOpenAIChunk(client_stream: std.net.Stream, text: []const u8, openai_id: [
     const w = &buf.writer;
     try w.print("data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":", .{ openai_id, model });
     try std.json.Stringify.encodeJsonString(text, .{}, w);
-    try w.writeAll("},\"finish_reason\":null}]}}\n\n");
+    try w.writeAll("},\"finish_reason\":null}]}\n\n");
     try socket.send(client_stream, buf.written());
 }

@@ -214,7 +214,6 @@ fn fetchModelsDirect(allocator: std.mem.Allocator, bearer: []const u8) ![]const 
     }) catch return error.UpstreamError;
 
     if (result.status != .ok) {
-        response_buf.deinit();
         return error.UpstreamError;
     }
     return try response_buf.toOwnedSlice();
@@ -223,7 +222,12 @@ fn fetchModelsDirect(allocator: std.mem.Allocator, bearer: []const u8) ![]const 
 // ── Billing ──
 
 pub fn fetchBillingUsage(allocator: std.mem.Allocator, acc: *accounts.Account) ![]const u8 {
-    const auth_header = try std.fmt.allocPrint(allocator, "{s} {s}", .{ acc.user_id, acc.credential_json });
+    return fetchBillingUsageRaw(allocator, acc.user_id, acc.credential_json);
+}
+
+/// Fetch billing/user info with raw credentials (no Account struct needed).
+pub fn fetchBillingUsageRaw(allocator: std.mem.Allocator, user_id: []const u8, credential_json: []const u8) ![]const u8 {
+    const auth_header = try std.fmt.allocPrint(allocator, "{s} {s}", .{ user_id, credential_json });
     defer allocator.free(auth_header);
 
     var response_buf: std.io.Writer.Allocating = .init(allocator);
@@ -246,7 +250,6 @@ pub fn fetchBillingUsage(allocator: std.mem.Allocator, acc: *accounts.Account) !
     if (result.status != .ok) {
         const err_body = response_buf.written();
         std.debug.print("[zed] users/me failed {}: {s}\n", .{ result.status, err_body });
-        response_buf.deinit();
         return error.BillingFetchFailed;
     }
     return try response_buf.toOwnedSlice();

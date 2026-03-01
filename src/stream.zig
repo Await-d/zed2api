@@ -52,6 +52,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         return false;
     };
     defer allocator.free(payload);
+    std.debug.print("[stream] zed payload: {d} bytes (client input: {d} bytes)\n", .{ payload.len, body.len });
 
     const jwt = zed.getToken(allocator, acc) catch |err| {
         std.debug.print("[stream] getToken failed: {}\n", .{err});
@@ -124,6 +125,10 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
 
     const model = providers.extractModelFromBody(allocator, body) catch "claude-sonnet-4-5";
 
+    // Generate a stable ID for OpenAI format based on current time
+    var openai_id_buf: [32]u8 = undefined;
+    const openai_id = std.fmt.bufPrint(&openai_id_buf, "chatcmpl-{x}", .{@as(u64, @bitCast(std.time.milliTimestamp()))}) catch "chatcmpl-zed";
+
     while (true) {
         var one: [1]u8 = undefined;
         const n = stdout.read(&one) catch break;
@@ -140,6 +145,21 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                     http_headers_done = true;
                     if (http_status != 0 and http_status != 200) {
                         std.debug.print("[stream] upstream HTTP {d}\n", .{http_status});
+                        // Drain remaining body and log it for debugging
+                        var body_buf: [8192]u8 = undefined;
+                        var body_len: usize = 0;
+                        while (body_len < body_buf.len) {
+                            const nb = stdout.read(body_buf[body_len .. body_buf.len]) catch break;
+                            if (nb == 0) break;
+                            body_len += nb;
+                        }
+                        if (body_len > 0) {
+                            std.debug.print("[stream] upstream error body ({d} bytes): {s}\n", .{ body_len, body_buf[0..@min(body_len, 2000)] });
+                        } else {
+                            std.debug.print("[stream] upstream error body: (empty)\n", .{});
+                        }
+                        line_len = 0;
+                        break;
                     }
                 } else if (std.mem.startsWith(u8, trimmed, "HTTP/")) {
                     // Parse status code from "HTTP/1.1 200 OK" or "HTTP/2 200"
@@ -169,12 +189,14 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                             _ = child.wait() catch {};
                             return false;
                         };
-                        var msg_start_buf: [512]u8 = undefined;
-                        const msg_start = std.fmt.bufPrint(&msg_start_buf, "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{s}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n", .{model}) catch "";
-                        socket.send(client_stream, msg_start) catch {};
+                        if (is_anthropic) {
+                            var msg_start_buf: [512]u8 = undefined;
+                            const msg_start = std.fmt.bufPrint(&msg_start_buf, "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{s}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n", .{model}) catch "";
+                            socket.send(client_stream, msg_start) catch {};
+                        }
                     }
                     got_any_data = true;
-                    convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
+                    convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, is_anthropic, openai_id, model, allocator) catch break;
                 } else {
                     std.debug.print("[stream] non-JSON from upstream ({d} bytes): {s}\n", .{ line.len, line[0..@min(line.len, 500)] });
                 }
@@ -189,11 +211,19 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     }
 
     if (headers_sent) {
-        const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
-        var stop_buf: [256]u8 = undefined;
-        const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
-        socket.send(client_stream, stop_msg) catch {};
-        socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
+        if (is_anthropic) {
+            const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
+            var stop_buf: [256]u8 = undefined;
+            const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
+            socket.send(client_stream, stop_msg) catch {};
+            socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
+        } else {
+            // OpenAI format: finish_reason reflects response type (tool_calls or stop)
+            var finish_buf: [512]u8 = undefined;
+            const finish_reason = if (has_tool_use) "tool_calls" else "stop";
+            const finish_chunk = std.fmt.bufPrint(&finish_buf, "data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\ndata: [DONE]\n\n", .{ openai_id, finish_reason }) catch "data: [DONE]\n\n";
+            socket.send(client_stream, finish_chunk) catch {};
+        }
     }
 
     const stderr_pipe = child.stderr;
@@ -222,8 +252,9 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     return got_any_data;
 }
 
-/// Convert a single Zed streaming JSON line to Anthropic SSE events
-fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_index: *usize, has_tool_use: *bool, allocator: std.mem.Allocator) !void {
+/// Convert a single Zed streaming JSON line to SSE events.
+/// Emits Anthropic SSE when is_anthropic=true, OpenAI SSE chunks when is_anthropic=false.
+fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_index: *usize, has_tool_use: *bool, is_anthropic: bool, openai_id: []const u8, model: []const u8, allocator: std.mem.Allocator) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
     defer parsed.deinit();
 
@@ -248,6 +279,7 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
             }
 
             if (std.mem.eql(u8, event_type, "content_block_start")) {
+                if (!is_anthropic) return; // OpenAI clients don't use content_block events
                 const cb = obj.object.get("content_block") orelse return;
                 if (cb != .object) return;
                 const cb_type = switch (cb.object.get("type") orelse return) { .string => |s| s, else => return };
@@ -277,6 +309,19 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
             if (std.mem.eql(u8, event_type, "content_block_delta")) {
                 const delta = obj.object.get("delta") orelse return;
                 if (delta != .object) return;
+                if (!is_anthropic) {
+                    // For OpenAI clients: extract text from text_delta and emit as OpenAI chunk
+                    const delta_type = switch (delta.object.get("type") orelse return) { .string => |s| s, else => return };
+                    if (std.mem.eql(u8, delta_type, "text_delta")) {
+                        if (delta.object.get("text")) |t| {
+                            if (t == .string and t.string.len > 0) {
+                                try emitOpenAIChunk(client_stream, t.string, openai_id, model, allocator);
+                            }
+                        }
+                    }
+                    // input_json_delta and thinking_delta are skipped for OpenAI clients
+                    return;
+                }
                 var buf: std.io.Writer.Allocating = .init(allocator);
                 defer buf.deinit();
                 const w = &buf.writer;
@@ -288,6 +333,7 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
             }
 
             if (std.mem.eql(u8, event_type, "content_block_stop")) {
+                if (!is_anthropic) return; // OpenAI clients don't use content_block events
                 var buf: [256]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{block_index.*}) catch return;
                 try socket.send(client_stream, msg);
@@ -296,14 +342,16 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
             }
 
             if (std.mem.eql(u8, event_type, "ping")) {
-                try socket.send(client_stream, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+                if (is_anthropic) {
+                    try socket.send(client_stream, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+                }
                 return;
             }
 
             if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
                 if (obj.object.get("delta")) |d| {
                     if (d == .string and d.string.len > 0) {
-                        try emitTextDelta(client_stream, d.string, block_index, allocator);
+                        try emitTextDelta(client_stream, d.string, block_index, is_anthropic, openai_id, model, allocator);
                     }
                 }
                 return;
@@ -320,7 +368,7 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
                     if (delta == .object) {
                         if (delta.object.get("content")) |c| {
                             if (c == .string and c.string.len > 0) {
-                                try emitTextDelta(client_stream, c.string, block_index, allocator);
+                                try emitTextDelta(client_stream, c.string, block_index, is_anthropic, openai_id, model, allocator);
                             }
                         }
                     }
@@ -330,7 +378,7 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
         return;
     }
 
-    // Google (Gemini)
+    // Google (Gemini) — raw Gemini API format returned by Zed
     if (obj.object.get("candidates")) |candidates| {
         if (candidates == .array and candidates.array.items.len > 0) {
             const cand = candidates.array.items[0];
@@ -338,12 +386,22 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
                 if (cand.object.get("content")) |content| {
                     if (content == .object) {
                         if (content.object.get("parts")) |parts| {
-                            if (parts == .array and parts.array.items.len > 0) {
-                                const part = parts.array.items[0];
-                                if (part == .object) {
+                            if (parts == .array) {
+                                var call_idx: usize = 0;
+                                for (parts.array.items) |part| {
+                                    if (part != .object) continue;
+                                    // Text response
                                     if (part.object.get("text")) |t| {
                                         if (t == .string and t.string.len > 0) {
-                                            try emitTextDelta(client_stream, t.string, block_index, allocator);
+                                            try emitTextDelta(client_stream, t.string, block_index, is_anthropic, openai_id, model, allocator);
+                                        }
+                                    }
+                                    // Tool call (functionCall) — convert to OpenAI/Anthropic format
+                                    if (part.object.get("functionCall")) |fc| {
+                                        if (fc == .object) {
+                                            has_tool_use.* = true;
+                                            try emitGeminiFunctionCall(client_stream, fc, is_anthropic, openai_id, model, block_index, call_idx, allocator);
+                                            call_idx += 1;
                                         }
                                     }
                                 }
@@ -357,7 +415,110 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
     }
 }
 
-fn emitTextDelta(client_stream: std.net.Stream, text: []const u8, block_index: *usize, allocator: std.mem.Allocator) !void {
+/// Convert a Gemini functionCall to OpenAI tool_calls or Anthropic tool_use SSE format.
+fn emitGeminiFunctionCall(
+    client_stream: std.net.Stream,
+    fc: std.json.Value,
+    is_anthropic: bool,
+    openai_id: []const u8,
+    model: []const u8,
+    block_index: *usize,
+    call_idx: usize,
+    allocator: std.mem.Allocator,
+) !void {
+    const name = if (fc.object.get("name")) |n| (if (n == .string) n.string else return) else return;
+    const args = fc.object.get("args") orelse std.json.Value{ .null = {} };
+
+    // Serialize args to JSON string
+    var args_buf: std.io.Writer.Allocating = .init(allocator);
+    defer args_buf.deinit();
+    try std.json.Stringify.value(args, .{}, &args_buf.writer);
+    const args_json = if (args_buf.written().len > 0 and !std.mem.eql(u8, args_buf.written(), "null"))
+        args_buf.written()
+    else
+        "{}";
+
+    if (!is_anthropic) {
+        // ── OpenAI streaming tool_calls format ──
+        // Chunk 1: establish tool call (role, id, name, empty arguments)
+        var id_buf: [32]u8 = undefined;
+        const call_id = std.fmt.bufPrint(&id_buf, "call_{x}{d}", .{ @as(u64, @bitCast(std.time.milliTimestamp())), call_idx }) catch "call_zed";
+
+        var buf1: std.io.Writer.Allocating = .init(allocator);
+        defer buf1.deinit();
+        const w1 = &buf1.writer;
+        try w1.print(
+            "data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\"," ++
+                "\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":null," ++
+                "\"tool_calls\":[{{\"id\":\"{s}\",\"type\":\"function\",\"index\":{d}," ++
+                "\"function\":{{\"name\":",
+            .{ openai_id, model, call_id, call_idx },
+        );
+        try std.json.Stringify.encodeJsonString(name, .{}, w1);
+        try w1.writeAll(",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+        try socket.send(client_stream, buf1.written());
+
+        // Chunk 2: arguments
+        var buf2: std.io.Writer.Allocating = .init(allocator);
+        defer buf2.deinit();
+        const w2 = &buf2.writer;
+        try w2.print(
+            "data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\"," ++
+                "\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d}," ++
+                "\"function\":{{\"arguments\":",
+            .{ openai_id, model, call_idx },
+        );
+        try std.json.Stringify.encodeJsonString(args_json, .{}, w2);
+        try w2.writeAll("}}]},\"finish_reason\":null}]}\n\n");
+        try socket.send(client_stream, buf2.written());
+    } else {
+        // ── Anthropic tool_use SSE format ──
+        // content_block_start → content_block_delta (input_json_delta) → content_block_stop
+        const idx = block_index.*;
+        var id_buf: [36]u8 = undefined;
+        const tool_id = providers.fakeUuid(&id_buf);
+
+        // content_block_start
+        var buf1: std.io.Writer.Allocating = .init(allocator);
+        defer buf1.deinit();
+        const w1 = &buf1.writer;
+        try w1.print(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d}," ++
+                "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":",
+            .{ idx, tool_id },
+        );
+        try std.json.Stringify.encodeJsonString(name, .{}, w1);
+        try w1.writeAll(",\"input\":{}}}\n\n");
+        try socket.send(client_stream, buf1.written());
+
+        // content_block_delta: full arguments as input_json_delta
+        var buf2: std.io.Writer.Allocating = .init(allocator);
+        defer buf2.deinit();
+        const w2 = &buf2.writer;
+        try w2.print(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d}," ++
+                "\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":",
+            .{idx},
+        );
+        try std.json.Stringify.encodeJsonString(args_json, .{}, w2);
+        try w2.writeAll("}}\n\n");
+        try socket.send(client_stream, buf2.written());
+
+        // content_block_stop
+        var stop_buf: [128]u8 = undefined;
+        const stop_msg = std.fmt.bufPrint(&stop_buf, "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{idx}) catch return;
+        try socket.send(client_stream, stop_msg);
+        block_index.* += 1;
+    }
+}
+
+/// Emit a text delta in the appropriate SSE format.
+fn emitTextDelta(client_stream: std.net.Stream, text: []const u8, block_index: *usize, is_anthropic: bool, openai_id: []const u8, model: []const u8, allocator: std.mem.Allocator) !void {
+    if (!is_anthropic) {
+        try emitOpenAIChunk(client_stream, text, openai_id, model, allocator);
+        return;
+    }
+    // Anthropic format
     if (block_index.* == 0) {
         try socket.send(client_stream, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
         block_index.* = 1;
@@ -368,5 +529,16 @@ fn emitTextDelta(client_stream: std.net.Stream, text: []const u8, block_index: *
     try w.writeAll("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":");
     try std.json.Stringify.encodeJsonString(text, .{}, w);
     try w.writeAll("}}\n\n");
+    try socket.send(client_stream, buf.written());
+}
+
+/// Emit a single OpenAI-format SSE chunk with text content.
+fn emitOpenAIChunk(client_stream: std.net.Stream, text: []const u8, openai_id: []const u8, model: []const u8, allocator: std.mem.Allocator) !void {
+    var buf: std.io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    const w = &buf.writer;
+    try w.print("data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":", .{ openai_id, model });
+    try std.json.Stringify.encodeJsonString(text, .{}, w);
+    try w.writeAll("},\"finish_reason\":null}]}}\n\n");
     try socket.send(client_stream, buf.written());
 }

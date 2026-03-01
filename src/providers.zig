@@ -56,7 +56,7 @@ fn extractSystemText(allocator: std.mem.Allocator, parsed: std.json.Value) ?[]co
     return null;
 }
 
-fn fakeUuid(buf: *[36]u8) []const u8 {
+pub fn fakeUuid(buf: *[36]u8) []const u8 {
     const hex = "0123456789abcdef";
     var rng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp()));
     const r = rng.random();
@@ -90,11 +90,21 @@ fn writeMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     try w.writeAll("}");
 }
 
-/// Write Anthropic-native message (passthrough content as-is, including tool_use/tool_result)
+/// Write Anthropic-native message, normalizing string content to array format.
+/// Zed's completions API requires content to be an array, not a plain string.
 fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     if (msg != .object) return;
-    // Passthrough the entire message object as-is for Anthropic native format
-    try std.json.Stringify.value(msg, .{}, w);
+    const content = msg.object.get("content");
+    // If content is already array or there's no content field, pass through as-is
+    if (content == null or content.? != .string) {
+        try std.json.Stringify.value(msg, .{}, w);
+        return;
+    }
+    // Normalize string content -> [{"type":"text","text":"..."}]
+    const role = switch (msg.object.get("role") orelse return) { .string => |s| s, else => return };
+    try w.print("{{\"role\":\"{s}\",\"content\":[{{\"type\":\"text\",\"text\":", .{role});
+    try std.json.Stringify.encodeJsonString(content.?.string, .{}, w);
+    try w.writeAll("}]}");
 }
 
 /// Write message with OpenAI->Anthropic tool support conversion
@@ -347,17 +357,140 @@ fn buildOpenAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
     try w.writeAll("]");
 }
 
+/// Write a JSON Schema sanitized for Gemini API compatibility.
+/// Removes: additionalProperties, anyOf/oneOf/allOf, converts ["type","null"] -> "type".
+/// Called recursively for nested objects.
+fn writeGeminiSchema(w: *std.io.Writer, schema: std.json.Value) !void {
+    if (schema != .object) {
+        try std.json.Stringify.value(schema, .{}, w);
+        return;
+    }
+    try w.writeAll("{");
+    var wrote = false;
+    // type: strip null from array types like ["string", "null"] -> "string"
+    if (schema.object.get("type")) |t| {
+        if (t == .array) {
+            // Find the non-null type
+            var real_type: ?[]const u8 = null;
+            for (t.array.items) |item| {
+                if (item == .string and !std.mem.eql(u8, item.string, "null")) {
+                    real_type = item.string;
+                    break;
+                }
+            }
+            if (real_type) |rt| {
+                if (wrote) try w.writeAll(",");
+                try w.writeAll("\"type\":");
+                try std.json.Stringify.encodeJsonString(rt, .{}, w);
+                wrote = true;
+            }
+        } else if (t == .string) {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("\"type\":");
+            try std.json.Stringify.value(t, .{}, w);
+            wrote = true;
+        }
+    }
+    // description
+    if (schema.object.get("description")) |d| {
+        if (d == .string) {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("\"description\":");
+            try std.json.Stringify.value(d, .{}, w);
+            wrote = true;
+        }
+    }
+    // enum
+    if (schema.object.get("enum")) |e| {
+        if (e == .array) {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("\"enum\":");
+            try std.json.Stringify.value(e, .{}, w);
+            wrote = true;
+        }
+    }
+    // properties - recurse
+    if (schema.object.get("properties")) |props| {
+        if (props == .object) {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("\"properties\":{");
+            var first_prop = true;
+            var it = props.object.iterator();
+            while (it.next()) |kv| {
+                if (!first_prop) try w.writeAll(",");
+                first_prop = false;
+                try std.json.Stringify.encodeJsonString(kv.key_ptr.*, .{}, w);
+                try w.writeAll(":");
+                try writeGeminiSchema(w, kv.value_ptr.*);
+            }
+            try w.writeAll("}");
+            wrote = true;
+        }
+    }
+    // required (only if non-empty)
+    if (schema.object.get("required")) |req| {
+        if (req == .array and req.array.items.len > 0) {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("\"required\":");
+            try std.json.Stringify.value(req, .{}, w);
+            wrote = true;
+        }
+    }
+    // items (for arrays)
+    if (schema.object.get("items")) |items| {
+        if (wrote) try w.writeAll(",");
+        try w.writeAll("\"items\":");
+        try writeGeminiSchema(w, items);
+        wrote = true;
+    }
+    try w.writeAll("}");
+}
 fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
     try w.print("\"model\":\"models/{s}\",", .{model});
 
+    // System instruction
     if (is_anthropic) {
         if (extractSystemText(allocator, parsed)) |sys_text| {
             try w.writeAll("\"systemInstruction\":{\"parts\":[{\"text\":");
             try std.json.Stringify.encodeJsonString(sys_text, .{}, w);
             try w.writeAll("}]},");
         }
+    } else {
+        // OpenAI format: extract system role messages from messages array
+        if (parsed.object.get("messages")) |msgs| {
+            if (msgs == .array) {
+                var sys_buf: std.io.Writer.Allocating = .init(allocator);
+                defer sys_buf.deinit();
+                for (msgs.array.items) |msg| {
+                    if (msg != .object) continue;
+                    const role = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+                    if (!std.mem.eql(u8, role, "system")) continue;
+                    const content = msg.object.get("content") orelse continue;
+                    switch (content) {
+                        .string => |s| try sys_buf.writer.writeAll(s),
+                        .array => {
+                            for (content.array.items) |item| {
+                                if (item == .object) {
+                                    if (item.object.get("text")) |t| {
+                                        if (t == .string) try sys_buf.writer.writeAll(t.string);
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                if (sys_buf.written().len > 0) {
+                    try w.writeAll("\"systemInstruction\":{\"parts\":[{\"text\":");
+                    try std.json.Stringify.encodeJsonString(sys_buf.written(), .{}, w);
+                    try w.writeAll("}]},");
+                }
+            }
+        }
     }
 
+    // Generation config — add thinkingConfig if client requested thinking
+    // generationConfig — Gemini thinking via Zed is not supported; always use standard config
     try w.writeAll("\"generationConfig\":{\"candidateCount\":1,\"stopSequences\":[],\"temperature\":1.0},");
 
     // Tools support for Google format
@@ -374,7 +507,7 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
                     try w.writeAll("{");
                     if (tool.object.get("name")) |n| { try w.writeAll("\"name\":"); try std.json.Stringify.value(n, .{}, w); }
                     if (tool.object.get("description")) |d| { try w.writeAll(",\"description\":"); try std.json.Stringify.value(d, .{}, w); }
-                    if (tool.object.get("input_schema")) |s| { try w.writeAll(",\"parameters\":"); try std.json.Stringify.value(s, .{}, w); }
+                    if (tool.object.get("input_schema")) |s| { try w.writeAll(",\"parameters\":"); try writeGeminiSchema(w, s); }
                     try w.writeAll("}");
                 }
                 try w.writeAll("]}],");
@@ -395,7 +528,7 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
                     try w.writeAll("{");
                     if (func.object.get("name")) |n| { try w.writeAll("\"name\":"); try std.json.Stringify.value(n, .{}, w); }
                     if (func.object.get("description")) |d| { try w.writeAll(",\"description\":"); try std.json.Stringify.value(d, .{}, w); }
-                    if (func.object.get("parameters")) |p| { try w.writeAll(",\"parameters\":"); try std.json.Stringify.value(p, .{}, w); }
+                    if (func.object.get("parameters")) |p| { try w.writeAll(",\"parameters\":"); try writeGeminiSchema(w, p); }
                     try w.writeAll("}");
                 }
                 try w.writeAll("]}],");
@@ -403,38 +536,46 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
         }
     }
 
+    // Contents — skip system messages (already written to systemInstruction above)
     try w.writeAll("\"contents\":[");
-
     if (parsed.object.get("messages")) |msgs| {
-        if (msgs == .array) for (msgs.array.items, 0..) |msg, i| {
-            if (msg != .object) continue;
-            const role = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
-            const content = msg.object.get("content") orelse continue;
-            if (i > 0) try w.writeAll(",");
-            const gemini_role = if (std.mem.eql(u8, role, "assistant")) "model" else role;
-            try w.print("{{\"parts\":[", .{});
-            switch (content) {
-                .string => |s| {
-                    try w.writeAll("{\"text\":");
-                    try std.json.Stringify.encodeJsonString(s, .{}, w);
-                    try w.writeAll("}");
-                },
-                .array => {
-                    for (content.array.items, 0..) |item, ci| {
-                        if (ci > 0) try w.writeAll(",");
-                        if (item == .object) {
+        if (msgs == .array) {
+            var wrote_any = false;
+            for (msgs.array.items) |msg| {
+                if (msg != .object) continue;
+                const role = switch (msg.object.get("role") orelse continue) { .string => |s| s, else => continue };
+                // Skip system messages — they are in systemInstruction
+                if (std.mem.eql(u8, role, "system")) continue;
+                const content = msg.object.get("content") orelse continue;
+                if (wrote_any) try w.writeAll(",");
+                wrote_any = true;
+                // Gemini only accepts "user" and "model" roles in contents
+                const gemini_role = if (std.mem.eql(u8, role, "assistant")) "model" else "user";
+                try w.writeAll("{\"parts\":[");
+                switch (content) {
+                    .string => |s| {
+                        try w.writeAll("{\"text\":");
+                        try std.json.Stringify.encodeJsonString(s, .{}, w);
+                        try w.writeAll("}");
+                    },
+                    .array => {
+                        var wrote_part = false;
+                        for (content.array.items) |item| {
+                            if (item != .object) continue;
                             const text_val = item.object.get("text") orelse continue;
                             if (text_val != .string) continue;
+                            if (wrote_part) try w.writeAll(",");
+                            wrote_part = true;
                             try w.writeAll("{\"text\":");
                             try std.json.Stringify.encodeJsonString(text_val.string, .{}, w);
                             try w.writeAll("}");
                         }
-                    }
-                },
-                else => {},
+                    },
+                    else => {},
+                }
+                try w.print("],\"role\":\"{s}\"}}", .{gemini_role});
             }
-            try w.print("],\"role\":\"{s}\"}}", .{gemini_role});
-        };
+        }
     }
     try w.writeAll("]");
 }
